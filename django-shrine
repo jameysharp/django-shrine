@@ -1,0 +1,425 @@
+#!/usr/bin/env python
+# Copyright 2023 Jamey Sharp
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import django
+django.setup()
+
+import codecs
+from collections import defaultdict
+from django.template import base, defaulttags, loader_tags, engines
+from django.template.backends.django import DjangoTemplates
+from django.templatetags import static
+import os
+import re
+
+def get_backend(name=None):
+    if name is not None:
+        return engines[name]
+    for backend in engines.all():
+        if isinstance(backend, DjangoTemplates):
+            return backend
+    raise Exception("no DjangoTemplate backend found, try specifying --backend")
+
+TOKEN_TYPES = {
+    base.TOKEN_TEXT: ("", ""),
+    base.TOKEN_VAR: (base.VARIABLE_TAG_START + " ", " " + base.VARIABLE_TAG_END),
+    base.TOKEN_BLOCK: (base.BLOCK_TAG_START + " ", " " + base.BLOCK_TAG_END),
+    base.TOKEN_COMMENT: (base.COMMENT_TAG_START + " ", " " + base.COMMENT_TAG_END),
+}
+
+def rewrite_template(backend, template_name):
+    # Load the template using the configured DjangoTemplates backend.
+    template = backend.get_template(template_name).template
+
+    # Rewrite e.g. appname/templates/dir/file.html to appname/jinja2/dir/file.html.
+    assert template.origin.name.endswith(template.name)
+    basedir = os.path.dirname(os.path.dirname(template.origin.name[:-len(template.name)]))
+    outfile = os.path.join(basedir, "jinja2", template.name)
+    print(outfile)
+    try:
+        os.makedirs(os.path.dirname(outfile))
+    except:
+        # The directory probably already exists.
+        pass
+
+    # `get_template` returns a fully parsed template, but we need to parse it
+    # again with our instrumented parser to collect more information about how
+    # the template tags interpreted the source. We rely on the default loader
+    # to:
+    # - set up the Django templates engine
+    # - read the template source
+    # - handle template character encodings
+    # After it does all that, getting it to stop without also parsing the
+    # template is too much trouble, but this isn't performance critical.
+    template = TracingTemplate(template.source, template.origin, template.name, template.engine)
+
+    # Recurse over the parsed tree of nodes, finding nodes which need special
+    # treatment and recording their replacements.
+    nodes = RewriteNodes()
+    nodes.go(template.nodelist)
+
+    # Finally, loop over every token from Django's lexer and apply any
+    # replacements collected either during parsing or while walking over the
+    # node tree.
+    with codecs.open(outfile, mode="w", encoding="utf-8") as f:
+        for token in template.tokens:
+            # A few block tags get special treatment.
+            replacement = BLOCK_REWRITERS.get(token.contents)
+            if replacement is None or token.token_type != base.TOKEN_BLOCK:
+                # Was there a node that we decided to rewrite which had this
+                # token attached to it?
+                replacement = nodes.rewrites.get(token)
+
+                if replacement is None:
+                    # If there was no node corresponding to this token, or we
+                    # don't have any special treatment for this node, just turn
+                    # the token back into a string with the right prefix/suffix
+                    # for its type.
+                    start, end = TOKEN_TYPES[token.token_type]
+                    replacement = start + token.contents + end
+
+                # Now we have a complete token. If it's a block or variable
+                # token, the parser might have been asked for some filters or
+                # variables and recorded replacements for those.
+                for old, new in template.parser.rewrites.get(token, {}).items():
+                    replacement = replacement.replace(old, new)
+
+                # Internally, Django treats the argument to the `filter` tag as
+                # though it were a filter chain beginning with a fake variable
+                # named `var`. We rewrite the node to match, then apply any
+                # filter-chain above, and now we need to get rid of the fake
+                # variable again.
+                replacement = re.sub(r"^{% filter var\|", "{% filter ", replacement)
+
+            # All rewrites finished; append this token to the output!
+            f.write(replacement)
+
+    return (template.parser.used_variables, template.parser.unknown_filters, nodes.unknown_nodes)
+
+class TracingParser(base.Parser):
+    def __init__(self, *args, **kwargs):
+        super(TracingParser, self).__init__(*args, **kwargs)
+        self.current_token = None
+        self.current_filters = []
+        self.used_variables = set()
+        self.unknown_filters = set()
+        self.rewrites = defaultdict(dict)
+
+    def next_token(self):
+        token = super(TracingParser, self).next_token()
+        self.current_token = token
+        return token
+
+    def find_filter(self, filter_name):
+        func = super(TracingParser, self).find_filter(filter_name)
+        self.current_filters.append((filter_name, func))
+        return func
+
+    def compile_filter(self, token):
+        assert not self.current_filters
+        expr = super(TracingParser, self).compile_filter(token)
+        assert len(self.current_filters) == len(expr.filters)
+
+        matched = self.rewrite_var(expr.var)
+        for (filter_name, found_func), (filter_func, args) in zip(self.current_filters, expr.filters):
+            assert found_func == filter_func
+            assert len(args) <= 1
+
+            try:
+                rewriter = FILTER_REWRITERS[filter_name]
+            except KeyError:
+                self.unknown_filters.add(filter_name)
+                rewriter = None
+
+            if rewriter is None:
+                rewriter = "{input}|" + filter_name
+                if args:
+                    rewriter += "({escaped})"
+
+            if "{escaped}" in rewriter:
+                matched = rewriter.format(input=matched, escaped=self.rewrite_var(args[0][1]))
+            elif "{raw}" in rewriter:
+                matched = rewriter.format(input=matched, raw=args[0][1])
+            else:
+                matched = rewriter.format(input=matched)
+
+        if token != matched:
+            self.rewrites[self.current_token][token] = matched
+
+        self.current_filters = []
+        return expr
+
+    def rewrite_var(self, var):
+        if isinstance(var, base.Variable):
+            if var.lookups is not None:
+                self.used_variables.add(var.var)
+            path = var.var
+            for rewriter in VARIABLE_REWRITERS:
+                path = re.sub(r"\b" + rewriter[0] + r"\b", rewriter[1], path)
+            return path
+        return escape_string_literal(var)
+
+def escape_string_literal(s):
+    single = "'"
+    double = '"'
+    if s.count(single) <= s.count(double):
+        quote = single
+    else:
+        quote = double
+    return quote + s.replace('\\', r'\\').replace(quote, '\\' + quote) + quote
+
+class TracingTemplate(base.Template):
+    def compile_nodelist(self):
+        self.tokens = base.Lexer(self.source).tokenize()
+        self.parser = TracingParser(
+            self.tokens[:],
+            self.engine.template_libraries, self.engine.template_builtins,
+            self.origin,
+        )
+        return self.parser.parse()
+
+class RewriteNodes:
+    def __init__(self):
+        self.rewrites = {}
+        self.unknown_nodes = set()
+
+    def go(self, nodelist):
+        for node in nodelist:
+            try:
+                rewriter = NODE_REWRITERS[node.__class__]
+                if rewriter is not None:
+                    self.rewrites[node.token] = rewriter(node)
+            except KeyError:
+                self.unknown_nodes.add(node.__class__)
+                pass
+            for attr in node.child_nodelists:
+                children = getattr(node, attr, None)
+                if children:
+                    self.go(children)
+
+def set_asvar(var, expr):
+    if var:
+        return "{% set " + var + " = " + expr + " %}"
+    return "{{ " + expr + " }}"
+
+def rewrite_autoescape_node(node):
+    if node.setting:
+        setting = "true"
+    else:
+        setting = "false"
+    return "{% autoescape " + setting + " %}"
+
+def rewrite_filter_node(node):
+    return "{% filter " + node.filter_expr.token + " %}"
+
+def rewrite_first_of_node(node):
+    result = node.vars[0].token
+    for var in node.vars[1:]:
+        result += "|default(" + var.token + ")"
+    return set_asvar(node.asvar, result)
+
+def rewrite_url_node(node):
+    args = [node.view_name.token]
+    if node.args:
+        args.append("args=[" + ", ".join(arg.token for arg in node.args) + "]")
+    if node.kwargs:
+        args.append("kwargs={" + ", ".join("{}: {}".format(escape_string_literal(k), v.token) for k, v in node.kwargs.items()) + "}")
+    return set_asvar(node.asvar, "url(" + ", ".join(args) + ")")
+
+def rewrite_widthratio_node(node):
+    return set_asvar(
+        node.asvar,
+        "({} / {} * {})|round|int".format(node.val_expr.token, node.max_expr.token, node.max_width.token)
+    )
+
+def rewrite_with_node(node):
+    args = [k + " = " + v.token for k, v in node.extra_context.items()]
+    return "{% with " + ", ".join(args) + " %}"
+
+def rewrite_include_node(node):
+    if node.isolated_context:
+        print("WARN: 'only' flag not supported (in {!r})".format(node.token.contents))
+    result = "{% include " + node.template.token + " %}"
+    if node.extra_context:
+        return rewrite_with_node(node) + result + "{% endwith %}"
+    return result
+
+def rewrite_static_prefix_node(node):
+    # node.name is the name of a Django setting, either STATIC_URL or MEDIA_URL
+    return set_asvar(node.varname, node.name)
+
+NODE_REWRITERS = {
+    # tags which are known to work the same in Jinja2 as they do in Django:
+    base.TextNode: None,
+    base.VariableNode: None,
+    defaulttags.ForNode: None,
+    defaulttags.IfNode: None,
+    defaulttags.SpacelessNode: None,  # with a custom extension
+    loader_tags.BlockNode: None,
+    loader_tags.ExtendsNode: None,
+
+    # tags which need to be replaced:
+    defaulttags.AutoEscapeControlNode: rewrite_autoescape_node,
+    defaulttags.CsrfTokenNode: lambda node: "{{ csrf_input }}",
+    defaulttags.FilterNode: rewrite_filter_node,
+    defaulttags.FirstOfNode: rewrite_first_of_node,
+    defaulttags.LoadNode: lambda node: "",
+    defaulttags.URLNode: rewrite_url_node,
+    defaulttags.WidthRatioNode: rewrite_widthratio_node,
+    defaulttags.WithNode: rewrite_with_node,
+    loader_tags.IncludeNode: rewrite_include_node,
+    static.PrefixNode: rewrite_static_prefix_node,
+
+    # handled specially with `BLOCK_REWRITERS`
+    defaulttags.CommentNode: None,
+}
+
+# Some block tags don't save all the tokens we need to replace. In those cases,
+# so far both the original and the replacement have been fixed strings, so a
+# simple lookup table has been good enough.
+BLOCK_REWRITERS = {
+    "comment": "{# ",
+    "endcomment": " #}",
+    # Django's {% for %}/{% empty %} is {% for %}/{% else %} in Jinja2
+    "empty": "{% else %}",
+}
+
+FILTER_REWRITERS = {
+    # filters which work the same in Jinja2 as they do in Django:
+    "first": None,
+    "join": None,
+    "length": None,
+    "random": None,
+    "safe": None,
+    "title": None,
+    "upper": None,
+    "urlencode": None,
+
+    # filters which don't exist in Jinja2 but can trivially be added from Django's implementation:
+    "date": None,
+    "default_if_none": None,
+    "floatformat": None,
+    "intcomma": None,
+    "linebreaks": None,
+    "markdown": None,
+    "pluralize": None,
+    "time": None,
+    "timesince": None,
+    "timeuntil": None,
+    "truncatewords": None,
+
+    # filters which need to be replaced:
+    "add": "({input} + {escaped})",
+    "default": "{input}|default({escaped}, true)",
+    "force_escape": "{input}|forceescape",  # no underscore
+    "make_list": "{input}|list",
+    "slice": "{input}[{raw}]",
+
+    # local extensions
+    "profile_thumbnail": "profile_photo({input}, gravatar_size=50)",
+    "profile_picture": "profile_photo({input}, gravatar_size=100)",
+    "profile_large": "profile_photo({input}, gravatar_size=200)",
+}
+
+VARIABLE_REWRITERS = [
+    # function calls
+    (r"(?:{})".format("|".join((
+        # requests
+        r"request\.get_host",
+        r"request\.is_secure",
+        # models
+        r"\.all",
+        r"\.count",
+        r"\.exists",
+        r"\.get_[a-z0-9_]+_(?:display|short)",
+        r"\.get_absolute_url",
+        r"\.select_related",
+        # auth
+        r"\.get_full_name",
+        r"\.has_usable_password",
+        # forms
+        r"\.as_p",
+        r"\.hidden_fields",
+        r"\.is_multipart",
+        r"\.non_field_errors",
+        r"\.visible_fields",
+        # pagination
+        r"\.has_next",
+        r"\.has_other_pages",
+        r"\.has_previous",
+        r"\.next_page_number",
+        r"\.previous_page_number",
+        # Python built-ins
+        r"\.items",
+        r"\.split",
+
+        # local extensions
+        r"\.describe_permissions",
+        r"\.get_sample_url",
+        r"^notification_count$",
+        r"^site_stats",
+    ))), r"\g<0>()"),
+
+    # Python 2 built-ins
+    (r"\.iteritems", r".items()"),
+    # auth
+    (r"^user", "request.user"),
+    (r"^perms.([^.]+)$", r"request.user.has_module_perms('\g<1>')"),
+    (r"^perms.([^.]+\.[^.]+)$", r"request.user.has_perm('\g<1>')"),
+    # template built-ins
+    (r"forloop\.counter", "loop.index"),
+    (r"forloop", "loop"),
+    # requests
+    (r"(request\.(?:GET|POST|COOKIES|FILES|META))\.([^.]+)", r"\g<1>['\g<2>']"),
+]
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Translate Django templates to Jinja2")
+    parser.add_argument("template", nargs="+")
+    parser.add_argument("--backend")
+    args = parser.parse_args()
+
+    backend = get_backend(args.backend)
+    used_variables = set()
+    unknown_filters = set()
+    unknown_nodes = set()
+    for name in args.template:
+        variables, filters, nodes = rewrite_template(backend, name)
+        used_variables.update(variables)
+        unknown_filters.update(filters)
+        unknown_nodes.update(nodes)
+
+    if used_variables:
+        by_context = defaultdict(list)
+        for variable in sorted(used_variables):
+            parts = variable.split(".", 1)
+            if len(parts) < 2:
+                parts.insert(0, "")
+            elif by_context[""][-1] == parts[0]:
+                by_context[""].pop()
+            by_context[parts[0]].append(parts[1])
+        print("variables: " + " ".join(by_context.pop("", [])))
+        for context, lookups in sorted(by_context.items()):
+            print("- {}: {}".format(context, " ".join(lookups)))
+
+    if unknown_filters:
+        print("unknown filters: " + ", ".join(sorted(unknown_filters)))
+    if unknown_nodes:
+        print("unknown nodes: " + ", ".join(repr(node) for node in unknown_nodes))
