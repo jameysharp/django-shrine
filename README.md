@@ -99,8 +99,9 @@ TEMPLATES = [
 ]
 ```
 
-See <examples/tmpl.py> for a sample Jinja2 environment configuration,
-demonstrating how to make Django filters available in Jinja2 templates.
+See [examples/tmpl.py](examples/tmpl.py) for a sample Jinja2 environment
+configuration, demonstrating how to make Django filters available in
+Jinja2 templates.
 
 # Why?
 
